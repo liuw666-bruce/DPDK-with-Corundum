@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Copyright(c) 2010-2016 Intel Corporation
+ * Copyright(c) 2022 Bruce
  */
 
 #include <sys/queue.h>
@@ -43,27 +43,7 @@
 #include "mqnic_hw.h"
 #include "mqnic_ethdev.h"
 
-#if 0
-#ifdef RTE_LIBRTE_IEEE1588
-#define IGB_TX_IEEE1588_TMST PKT_TX_IEEE1588_TMST
-#else
-#define IGB_TX_IEEE1588_TMST 0
-#endif
-/* Bit Mask to indicate what bits required for building TX context */
-#define IGB_TX_OFFLOAD_MASK (			 \
-		PKT_TX_OUTER_IPV6 |	 \
-		PKT_TX_OUTER_IPV4 |	 \
-		PKT_TX_IPV6 |		 \
-		PKT_TX_IPV4 |		 \
-		PKT_TX_VLAN_PKT |		 \
-		PKT_TX_IP_CKSUM |		 \
-		PKT_TX_L4_MASK |		 \
-		PKT_TX_TCP_SEG |		 \
-		IGB_TX_IEEE1588_TMST)
-
-#define IGB_TX_OFFLOAD_NOTSUP_MASK \
-		(PKT_TX_OFFLOAD_MASK ^ IGB_TX_OFFLOAD_MASK)
-#endif
+#define DESC_BLOCK_SIZE 4
 
 /**
  * Structure associated with each descriptor of the RX ring of a RX queue.
@@ -76,7 +56,7 @@ struct mqnic_rx_entry {
  * Structure associated with each descriptor of the TX ring of a TX queue.
  */
 struct mqnic_tx_entry {
-	struct rte_mbuf *mbuf; /**< mbuf associated with TX desc, if any. */
+	struct rte_mbuf *mbuf[4]; /**< mbuf associated with TX desc, if any. */
 	uint16_t next_id; /**< Index of next descriptor in ring. */
 	uint16_t last_id; /**< Index of last scattered descriptor. */
 };
@@ -162,52 +142,6 @@ struct mqnic_rx_queue {
 };
 
 /**
- * Hardware context number
- */
-enum mqnic_advctx_num {
-	IGB_CTX_0    = 0, /**< CTX0    */
-	IGB_CTX_1    = 1, /**< CTX1    */
-	IGB_CTX_NUM  = 2, /**< CTX_NUM */
-};
-
-/** Offload features */
-union mqnic_tx_offload {
-	uint64_t data;
-	struct {
-		uint64_t l3_len:9; /**< L3 (IP) Header Length. */
-		uint64_t l2_len:7; /**< L2 (MAC) Header Length. */
-		uint64_t vlan_tci:16;  /**< VLAN Tag Control Identifier(CPU order). */
-		uint64_t l4_len:8; /**< L4 (TCP/UDP) Header Length. */
-		uint64_t tso_segsz:16; /**< TCP TSO segment size. */
-
-		/* uint64_t unused:8; */
-	};
-};
-
-/*
- * Compare mask for mqnic_tx_offload.data,
- * should be in sync with mqnic_tx_offload layout.
- * */
-#define TX_MACIP_LEN_CMP_MASK	0x000000000000FFFFULL /**< L2L3 header mask. */
-#define TX_VLAN_CMP_MASK		0x00000000FFFF0000ULL /**< Vlan mask. */
-#define TX_TCP_LEN_CMP_MASK		0x000000FF00000000ULL /**< TCP header mask. */
-#define TX_TSO_MSS_CMP_MASK		0x00FFFF0000000000ULL /**< TSO segsz mask. */
-/** Mac + IP + TCP + Mss mask. */
-#define TX_TSO_CMP_MASK	\
-	(TX_MACIP_LEN_CMP_MASK | TX_TCP_LEN_CMP_MASK | TX_TSO_MSS_CMP_MASK)
-
-/**
- * Strucutre to check if new context need be built
- */
-struct mqnic_advctx_info {
-	uint64_t flags;           /**< ol_flags related to context build. */
-	/** tx offload: vlan, tso, l2-l3-l4 lengths. */
-	union mqnic_tx_offload tx_offload;
-	/** compare mask for tx offload. */
-	union mqnic_tx_offload tx_offload_mask;
-};
-
-/**
  * Structure associated with each TX queue.
  */
 struct mqnic_tx_queue {
@@ -230,8 +164,6 @@ struct mqnic_tx_queue {
 	uint32_t               ctx_curr;
 	/**< Current used hardware descriptor. */
 	uint32_t               ctx_start;
-	/**< Start context position for transmit queue. */
-	struct mqnic_advctx_info ctx_cache[IGB_CTX_NUM];
 	/**< Hardware context history.*/
 	uint64_t	       offloads; /**< offloads of DEV_TX_OFFLOAD_* */
 
@@ -276,8 +208,6 @@ struct mqnic_tx_queue {
     uint8_t *hw_addr;
     uint8_t *hw_head_ptr;
     uint8_t *hw_tail_ptr;
-
-	int done;
 
 	struct mqnic_priv *priv;
 };
@@ -430,82 +360,32 @@ eth_mqnic_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 	uint16_t tx_last;
 	uint16_t nb_tx;
 	uint32_t i;
+	uint32_t sub_desc_index;
 	struct mqnic_priv *priv;
-    //int budget;
 
 	txq = tx_queue;
-	//budget = txq->nb_tx_desc>>1;
 	priv= txq->priv;
 	sw_ring = txq->sw_ring;
 	txr     = txq->tx_ring;
 	tx_id   = txq->tx_tail;
 	txe = &sw_ring[tx_id];
 
-	//PMD_TX_LOG(ERR, "done = %d, budget = %d", txq->done, budget);
-	//if(txq->done > budget){
-	//	txq->done = 0;
-		mqnic_check_tx_cpl(txq);
-	//}
+	mqnic_check_tx_cpl(txq);
 
 	for (nb_tx = 0; nb_tx < nb_pkts; nb_tx++) {
+		sub_desc_index = 0;
 		tx_pkt = *tx_pkts++;
 
-		RTE_MBUF_PREFETCH_TO_FREE(txe->mbuf);
+		RTE_MBUF_PREFETCH_TO_FREE(txe->mbuf[0]);
 
-		/*
-		 * The number of descriptors that must be allocated for a
-		 * packet is the number of segments of that packet, plus 1
-		 * Context Descriptor for the VLAN Tag Identifier, if any.
-		 * Determine the last TX descriptor to allocate in the TX ring
-		 * for the packet, starting from the current position (tx_id)
-		 * in the ring.
-		 */
-		tx_last = (uint16_t) (tx_id + tx_pkt->nb_segs - 1);
+		//tx_last = (uint16_t) (tx_id + tx_pkt->nb_segs - 1);
+		tx_last = (uint16_t) tx_id;
 
 		if (tx_last >= txq->nb_tx_desc)
 			tx_last = (uint16_t) (tx_last - txq->nb_tx_desc);
 
-		/*
-		 * Check if there are enough free descriptors in the TX ring
-		 * to transmit the next packet.
-		 * This operation is based on the two following rules:
-		 *
-		 *   1- Only check that the last needed TX descriptor can be
-		 *      allocated (by construction, if that descriptor is free,
-		 *      all intermediate ones are also free).
-		 *
-		 *      For this purpose, the index of the last TX descriptor
-		 *      used for a packet (the "last descriptor" of a packet)
-		 *      is recorded in the TX entries (the last one included)
-		 *      that are associated with all TX descriptors allocated
-		 *      for that packet.
-		 *
-		 *   2- Avoid to allocate the last free TX descriptor of the
-		 *      ring, in order to never set the TDT register with the
-		 *      same value stored in parallel by the NIC in the TDH
-		 *      register, which makes the TX engine of the NIC enter
-		 *      in a deadlock situation.
-		 *
-		 *      By extension, avoid to allocate a free descriptor that
-		 *      belongs to the last set of free descriptors allocated
-		 *      to the same packet previously transmitted.
-		 */
-
-		/*
-		 * The "last descriptor" of the previously sent packet, if any,
-		 * which used the last descriptor to allocate.
-		 */
 		tx_end = sw_ring[tx_last].last_id;
-
-		/*
-		 * The next descriptor following that "last descriptor" in the
-		 * ring.
-		 */
 		tx_end = sw_ring[tx_end].next_id;
-
-		/*
-		 * The "last descriptor" associated with that next descriptor.
-		 */
 		tx_end = sw_ring[tx_end].last_id;
 
 		if(mqnic_is_tx_queue_full(txq)){
@@ -516,9 +396,9 @@ eth_mqnic_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 		}
 
 		m_seg = tx_pkt;
+#if 0
 		do {
 			txn = &sw_ring[txe->next_id];
-			//txd = &txr[tx_id];
 			txd = &txr[tx_id*4];
 
 			if (txe->mbuf != NULL)
@@ -530,12 +410,8 @@ eth_mqnic_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 			 */
 			slen = (uint16_t) m_seg->data_len;
 			buf_dma_addr = rte_mbuf_data_iova(m_seg);
-			//txd->read.buffer_addr =
-			//	rte_cpu_to_le_64(buf_dma_addr);
 			txd->addr =
 				rte_cpu_to_le_64(buf_dma_addr);
-			//txd->read.cmd_type_len =
-			//	rte_cpu_to_le_32(cmd_type_len | slen);
 			txd->len =
 				rte_cpu_to_le_32(slen);
 
@@ -546,9 +422,6 @@ eth_mqnic_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
     		}
 
 			txq->head_ptr++;
-			//done++;
-			//txd->read.olinfo_status =
-			//	rte_cpu_to_le_32(olinfo_status);
 			txe->last_id = tx_last;
 			tx_id = txe->next_id;
 			txe = txn;
@@ -556,7 +429,42 @@ eth_mqnic_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 			priv->opackets++;
 			priv->obytes+=slen;
 		} while (m_seg != NULL);
+#endif
+		txn = &sw_ring[txe->next_id];
+		do {
+			txd = &txr[tx_id*4+sub_desc_index];
 
+			if (txe->mbuf[sub_desc_index] != NULL)
+				rte_pktmbuf_free_seg(txe->mbuf[sub_desc_index]);
+			txe->mbuf[sub_desc_index] = m_seg;
+
+			/*
+			 * Set up transmit descriptor.
+			 */
+			slen = (uint16_t) m_seg->data_len;
+			buf_dma_addr = rte_mbuf_data_iova(m_seg);
+			txd->addr =
+				rte_cpu_to_le_64(buf_dma_addr);
+			txd->len =
+				rte_cpu_to_le_32(slen);
+			
+			m_seg = m_seg->next;
+			priv->obytes+=slen;
+			sub_desc_index++;
+			if(sub_desc_index >= txq->desc_block_size)
+				break;
+		} while (m_seg != NULL);
+
+		for (i = sub_desc_index; i < 4; i++)
+    	{
+       		txd[i].len = 0;
+        	txd[i].addr = 0;
+    	}
+		txe->last_id = tx_last;
+		tx_id = txe->next_id;
+		txe = txn;
+		txq->head_ptr++;
+		priv->opackets++;
 	}
  end_of_tx:
 	rte_wmb();
@@ -566,54 +474,8 @@ eth_mqnic_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 		   (unsigned) txq->port_id, (unsigned) txq->queue_id,
 		   (unsigned) tx_id, (unsigned) nb_tx, (unsigned) txq->head_ptr);
 	txq->tx_tail = tx_id;
-	//txq->done += nb_tx;
 
 	return nb_tx;
-}
-
-/*********************************************************************
- *
- *  TX prep functions
- *
- **********************************************************************/
-uint16_t
-eth_mqnic_prep_pkts(__rte_unused void *tx_queue, struct rte_mbuf **tx_pkts,
-		uint16_t nb_pkts)
-{
-	int i, ret;
-	struct rte_mbuf *m;
-
-	for (i = 0; i < nb_pkts; i++) {
-		m = tx_pkts[i];
-
-		/* Check some limitations for TSO in hardware */
-		if (m->ol_flags & PKT_TX_TCP_SEG){
-				PMD_TX_LOG(ERR, "corundum don't support TCP segmentation offload");
-				rte_errno = ENOTSUP;
-				return i;
-		}
-
-		//if (m->ol_flags & IGB_TX_OFFLOAD_NOTSUP_MASK) {
-		//	PMD_TX_LOG(ERR, "IGB_TX_OFFLOAD_NOTSUP_MASK");
-		//	rte_errno = ENOTSUP;
-		//	return i;
-		//}
-
-#ifdef RTE_LIBRTE_ETHDEV_DEBUG
-		ret = rte_validate_tx_offload(m);
-		if (ret != 0) {
-			rte_errno = -ret;
-			return i;
-		}
-#endif
-		ret = rte_net_intel_cksum_prepare(m);
-		if (ret != 0) {
-			rte_errno = -ret;
-			return i;
-		}
-	}
-
-	return i;
 }
 
 /*********************************************************************
@@ -806,13 +668,15 @@ eth_mqnic_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 static void
 mqnic_tx_queue_release_mbufs(struct mqnic_tx_queue *txq)
 {
-	unsigned i;
+	unsigned i, j;
 
 	if (txq->sw_ring != NULL) {
 		for (i = 0; i < txq->nb_tx_desc; i++) {
-			if (txq->sw_ring[i].mbuf != NULL) {
-				rte_pktmbuf_free_seg(txq->sw_ring[i].mbuf);
-				txq->sw_ring[i].mbuf = NULL;
+			for(j = 0; j < DESC_BLOCK_SIZE; j++){
+				if (txq->sw_ring[i].mbuf[j] != NULL) {
+					rte_pktmbuf_free_seg(txq->sw_ring[i].mbuf[j]);
+					txq->sw_ring[i].mbuf[j] = NULL;
+				}
 			}
 		}
 	}
@@ -851,6 +715,7 @@ mqnic_tx_done_cleanup(struct mqnic_tx_queue *txq, uint32_t free_cnt)
 	uint16_t tx_last;  /* Last segment in the current packet. */
 	uint16_t tx_next;  /* First segment of the next packet. */
 	int count = 0;
+	int i = 0;
 	PMD_TX_LOG(DEBUG, "mqnic_tx_done_cleanup");
 
 	if (!txq)
@@ -882,7 +747,7 @@ mqnic_tx_done_cleanup(struct mqnic_tx_queue *txq, uint32_t free_cnt)
 	while (1) {
 		tx_last = sw_ring[tx_id].last_id;
 
-		if (sw_ring[tx_last].mbuf) {
+		if (sw_ring[tx_last].mbuf[0]) {
 			//if (txr[tx_last].wb.status &
 			//    MQNIC_TXD_STAT_DD) {
 			if(1){
@@ -898,11 +763,14 @@ mqnic_tx_done_cleanup(struct mqnic_tx_queue *txq, uint32_t free_cnt)
 				 * packet.
 				 */
 				do {
-					if (sw_ring[tx_id].mbuf) {
-						rte_pktmbuf_free_seg(
-							sw_ring[tx_id].mbuf);
-						sw_ring[tx_id].mbuf = NULL;
-						sw_ring[tx_id].last_id = tx_id;
+					for(i = 0; i < DESC_BLOCK_SIZE; i++){
+						if (sw_ring[tx_id].mbuf[i]) {
+							rte_pktmbuf_free_seg(
+								sw_ring[tx_id].mbuf[i]);
+							sw_ring[tx_id].mbuf[i] = NULL;
+							if(i == 0)
+								sw_ring[tx_id].last_id = tx_id;
+						}
 					}
 
 					/* Move to next segemnt. */
@@ -941,7 +809,7 @@ mqnic_tx_done_cleanup(struct mqnic_tx_queue *txq, uint32_t free_cnt)
 				/* Move to next segemnt. */
 				tx_id = sw_ring[tx_id].next_id;
 
-				if (sw_ring[tx_id].mbuf)
+				if (sw_ring[tx_id].mbuf[0])
 					break;
 
 			} while (tx_id != tx_first);
@@ -949,7 +817,7 @@ mqnic_tx_done_cleanup(struct mqnic_tx_queue *txq, uint32_t free_cnt)
 			/* Determine why previous loop bailed. If there
 			 * is not an mbuf, done.
 			 */
-			if (!sw_ring[tx_id].mbuf)
+			if (!sw_ring[tx_id].mbuf[0])
 				break;
 		}
 	}
@@ -972,8 +840,6 @@ mqnic_reset_tx_queue_stat(struct mqnic_tx_queue *txq)
 	txq->head_ptr = 0;
     txq->tail_ptr = 0;
     txq->clean_tail_ptr = 0;
-	memset((void*)&txq->ctx_cache, 0,
-		IGB_CTX_NUM * sizeof(struct mqnic_advctx_info));
 }
 
 static void
@@ -981,18 +847,20 @@ mqnic_reset_tx_queue(struct mqnic_tx_queue *txq, struct rte_eth_dev *dev)
 {
 	static const struct mqnic_desc zeroed_desc = {0, 0, 0, 0};
 	struct mqnic_tx_entry *txe = txq->sw_ring;
-	uint16_t i, prev;
+	uint16_t i, j, prev;
 	RTE_SET_USED(dev);
 
 	/* Zero out HW ring memory */
-	for (i = 0; i < txq->nb_tx_desc; i++) {
+	for (i = 0; i < txq->nb_tx_desc*DESC_BLOCK_SIZE; i++) {
 		txq->tx_ring[i] = zeroed_desc;
 	}
 
 	/* Initialize ring entries */
 	prev = (uint16_t)(txq->nb_tx_desc - 1);
 	for (i = 0; i < txq->nb_tx_desc; i++) {
-		txe[i].mbuf = NULL;
+		for(j = 0; j < DESC_BLOCK_SIZE; j++){
+			txe[i].mbuf[j] = NULL;
+		}
 		txe[i].last_id = i;
 		txe[prev].next_id = i;
 		prev = i;
@@ -1114,29 +982,12 @@ eth_mqnic_tx_queue_setup(struct rte_eth_dev *dev,
     txq->hw_ptr_mask = 0xffff;
     txq->hw_head_ptr = txq->hw_addr+MQNIC_QUEUE_HEAD_PTR_REG;
     txq->hw_tail_ptr = txq->hw_addr+MQNIC_QUEUE_TAIL_PTR_REG;
-
 	txq->head_ptr = 0;
     txq->tail_ptr = 0;
     txq->clean_tail_ptr = 0;
 
-	txq->done = 0;
-
-	// deactivate queue
-	MQNIC_DIRECT_WRITE_REG(txq->hw_addr, MQNIC_QUEUE_ACTIVE_LOG_SIZE_REG, 0);
-    // set base address
-	MQNIC_DIRECT_WRITE_REG(txq->hw_addr, MQNIC_QUEUE_BASE_ADDR_REG+0, txq->tx_ring_phys_addr);
-	MQNIC_DIRECT_WRITE_REG(txq->hw_addr, MQNIC_QUEUE_BASE_ADDR_REG+4, txq->tx_ring_phys_addr >> 32);
-    // set completion queue index
-	MQNIC_DIRECT_WRITE_REG(txq->hw_addr, MQNIC_QUEUE_CPL_QUEUE_INDEX_REG, 0);
-    // set pointers
-	MQNIC_DIRECT_WRITE_REG(txq->hw_addr, MQNIC_QUEUE_HEAD_PTR_REG, txq->head_ptr & txq->hw_ptr_mask);
-	MQNIC_DIRECT_WRITE_REG(txq->hw_addr, MQNIC_QUEUE_TAIL_PTR_REG, txq->tail_ptr & txq->hw_ptr_mask);
-    // set size
-	MQNIC_DIRECT_WRITE_REG(txq->hw_addr, MQNIC_QUEUE_ACTIVE_LOG_SIZE_REG, ilog2(txq->size) | (txq->log_desc_block_size << 8));
-
 	mqnic_reset_tx_queue(txq, dev);
-	dev->tx_pkt_burst = eth_mqnic_xmit_pkts;
-	dev->tx_pkt_prepare = &eth_mqnic_prep_pkts;
+
 	dev->data->tx_queues[queue_idx] = txq;
 	txq->offloads = offloads;
 
@@ -1316,19 +1167,6 @@ eth_mqnic_rx_queue_setup(struct rte_eth_dev *dev,
 	PMD_INIT_LOG(DEBUG, "rx sw_ring=%p hw_ring=%p dma_addr=0x%"PRIx64,
 		     rxq->sw_ring, rxq->rx_ring, rxq->rx_ring_phys_addr);
 
-	// deactivate queue
-	MQNIC_DIRECT_WRITE_REG(rxq->hw_addr, MQNIC_QUEUE_ACTIVE_LOG_SIZE_REG, 0);
-    // set base address
-	MQNIC_DIRECT_WRITE_REG(rxq->hw_addr, MQNIC_QUEUE_BASE_ADDR_REG+0, rxq->rx_ring_phys_addr);
-	MQNIC_DIRECT_WRITE_REG(rxq->hw_addr, MQNIC_QUEUE_BASE_ADDR_REG+4, rxq->rx_ring_phys_addr >> 32);
-    // set completion queue index
-	MQNIC_DIRECT_WRITE_REG(rxq->hw_addr, MQNIC_QUEUE_CPL_QUEUE_INDEX_REG, 0);
-    // set pointers
-	MQNIC_DIRECT_WRITE_REG(rxq->hw_addr, MQNIC_QUEUE_HEAD_PTR_REG, rxq->head_ptr & rxq->hw_ptr_mask);
-	MQNIC_DIRECT_WRITE_REG(rxq->hw_addr, MQNIC_QUEUE_TAIL_PTR_REG, rxq->tail_ptr & rxq->hw_ptr_mask);
-    // set size
-	MQNIC_DIRECT_WRITE_REG(rxq->hw_addr, MQNIC_QUEUE_ACTIVE_LOG_SIZE_REG, ilog2(rxq->size) | (rxq->log_desc_block_size << 8));
-
 	dev->data->rx_queues[queue_idx] = rxq;
 	mqnic_reset_rx_queue(rxq);
 
@@ -1449,10 +1287,7 @@ eth_mqnic_rx_init(struct rte_eth_dev *dev)
 	PMD_INIT_LOG(DEBUG, "eth_mqnic_rx_init");
 
 	/* Configure and enable each RX queue. */
-	dev->rx_pkt_burst = eth_mqnic_recv_pkts;
 	for (i = 0; i < dev->data->nb_rx_queues; i++) {
-		//uint64_t bus_addr;
-		//uint32_t rxdctl;
 
 		rxq = dev->data->rx_queues[i];
 		if (rxq == NULL) {
@@ -1469,9 +1304,6 @@ eth_mqnic_rx_init(struct rte_eth_dev *dev)
 			return ret;
 
 		mqnic_activate_rxq(rxq, i);
-		MQNIC_WRITE_FLUSH(priv);
-		// enqueue on NIC
-		mqnic_rx_write_head_ptr(rxq);
 		MQNIC_WRITE_FLUSH(priv);
 	}
 

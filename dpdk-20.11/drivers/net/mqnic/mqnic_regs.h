@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Copyright(c) 2001-2020 Intel Corporation
+ * Copyright(c) 2022 Bruce
  */
 
 #ifndef _MQNIC_REGS_H_
@@ -226,6 +226,5 @@
 #define MQNIC_DESC_SIZE 16
 #define MQNIC_CPL_SIZE 32
 #define MQNIC_EVENT_SIZE 32
-
 
 #endif

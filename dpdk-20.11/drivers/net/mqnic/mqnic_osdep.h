@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Copyright(c) 2001 - 2015 Intel Corporation
+ * Copyright(c) 2022 Bruce
  */
 /*$FreeBSD$*/
 
@@ -147,19 +147,8 @@ static inline uint16_t mqnic_read_addr16(volatile void *addr)
 	rte_panic("%s:%u\t" RTE_STR(x) "(%p, 0x%x, 0x%x)", \
 		__FILE__, __LINE__, (hw), (reg), (unsigned int)(value))
 
-/*
- * To be able to do IO write, we need to map IO BAR
- * (bar 2/4 depending on device).
- * Right now mapping multiple BARs is not supported by DPDK.
- * Fortunatelly we need it only for legacy hw support.
- */
-
 #define MQNIC_WRITE_REG_IO(hw, reg, value) \
 	MQNIC_WRITE_REG(hw, reg, value)
-
-/*
- * Tested on I217/I218 chipset.
- */
 
 #define MQNIC_READ_FLASH_REG(hw, reg) \
 	mqnic_read_addr(MQNIC_PCI_REG_FLASH_ADDR((hw), (reg)))

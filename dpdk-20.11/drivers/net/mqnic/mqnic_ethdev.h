@@ -390,8 +390,8 @@ void eth_mqnic_tx_init(struct rte_eth_dev *dev);
 uint16_t eth_mqnic_xmit_pkts(void *txq, struct rte_mbuf **tx_pkts,
 		uint16_t nb_pkts);
 
-uint16_t eth_mqnic_prep_pkts(void *txq, struct rte_mbuf **tx_pkts,
-		uint16_t nb_pkts);
+//uint16_t eth_mqnic_prep_pkts(void *txq, struct rte_mbuf **tx_pkts,
+//		uint16_t nb_pkts);
 
 uint16_t eth_mqnic_recv_pkts(void *rxq, struct rte_mbuf **rx_pkts,
 		uint16_t nb_pkts);

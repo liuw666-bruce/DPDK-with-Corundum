@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Copyright(c) 2010-2016 Intel Corporation
+ * Copyright(c) 2022 Bruce
  */
 
 #include <sys/queue.h>
@@ -52,8 +52,6 @@
 static int  eth_mqnic_configure(struct rte_eth_dev *dev);
 static int  eth_mqnic_start(struct rte_eth_dev *dev);
 static int  eth_mqnic_stop(struct rte_eth_dev *dev);
-static int  eth_mqnic_dev_set_link_up(struct rte_eth_dev *dev);
-static int  eth_mqnic_dev_set_link_down(struct rte_eth_dev *dev);
 static int eth_mqnic_close(struct rte_eth_dev *dev);
 static int eth_mqnic_reset(struct rte_eth_dev *dev);
 static int  eth_mqnic_promiscuous_enable(struct rte_eth_dev *dev);
@@ -67,12 +65,7 @@ static int eth_mqnic_stats_reset(struct rte_eth_dev *dev);
 static int eth_mqnic_infos_get(struct rte_eth_dev *dev,
 			      struct rte_eth_dev_info *dev_info);
 static const uint32_t *eth_mqnic_supported_ptypes_get(struct rte_eth_dev *dev);
-static int eth_mqnic_interrupt_get_status(struct rte_eth_dev *dev);
-static int eth_mqnic_interrupt_action(struct rte_eth_dev *dev,
-				    struct rte_intr_handle *handle);
-static void eth_mqnic_interrupt_handler(void *param);
 static int  eth_mqnic_mtu_set(struct rte_eth_dev *dev, uint16_t mtu);
-static void mqnic_intr_disable(struct rte_eth_dev *dev);
 
 /*
  * Define VF Stats MACRO for Non "cleared on read" register
@@ -116,8 +109,6 @@ static const struct eth_dev_ops eth_mqnic_ops = {
 	.dev_configure        = eth_mqnic_configure,
 	.dev_start            = eth_mqnic_start,
 	.dev_stop             = eth_mqnic_stop,
-	.dev_set_link_up      = eth_mqnic_dev_set_link_up,
-	.dev_set_link_down    = eth_mqnic_dev_set_link_down,
 	.dev_close            = eth_mqnic_close,
 	.dev_reset            = eth_mqnic_reset,
 	.promiscuous_enable   = eth_mqnic_promiscuous_enable,
@@ -877,17 +868,6 @@ eth_mqnic_get_if_hw_info(struct rte_eth_dev *dev)
 		priv->port_count = MQNIC_MAX_PORTS;
 }
 
-static inline void
-mqnic_intr_enable(struct rte_eth_dev *dev)
-{
-	RTE_SET_USED(dev);
-}
-
-static void
-mqnic_intr_disable(struct rte_eth_dev *dev)
-{
-	RTE_SET_USED(dev);
-}
 
 static int32_t
 mqnic_get_basic_info_from_hw(struct mqnic_hw *hw)
@@ -966,7 +946,6 @@ eth_mqnic_dev_init(struct rte_eth_dev *eth_dev)
 	eth_dev->dev_ops = &eth_mqnic_ops;
 	eth_dev->rx_pkt_burst = &eth_mqnic_recv_pkts;
 	eth_dev->tx_pkt_burst = &eth_mqnic_xmit_pkts;
-	eth_dev->tx_pkt_prepare = &eth_mqnic_prep_pkts;
 
 	/* for secondary processes, we don't initialise any further as primary
 	 * has already done this work. Only check we don't need a different
@@ -989,7 +968,6 @@ eth_mqnic_dev_init(struct rte_eth_dev *eth_dev)
 		goto err_late;
 	}
 
-	//hw->hw_addr = hw->hw_addr + 1*hw->if_stride;
 	hw->hw_addr = hw->hw_addr + 0*hw->if_stride;  //use interface 0
 	eth_mqnic_get_if_hw_info(eth_dev);
 	mqnic_determine_desc_block_size(eth_dev);
@@ -1008,13 +986,11 @@ eth_mqnic_dev_init(struct rte_eth_dev *eth_dev)
 
 	/* Allocate memory for storing MAC addresses */
 	eth_dev->data->mac_addrs = rte_zmalloc("mqnic",
-		RTE_ETHER_ADDR_LEN * 1, 0);
-		//RTE_ETHER_ADDR_LEN * hw->mac.rar_entry_count, 0);
+		RTE_ETHER_ADDR_LEN, 0);
 	if (eth_dev->data->mac_addrs == NULL) {
 		PMD_INIT_LOG(ERR, "Failed to allocate %d bytes needed to "
 						"store MAC addresses",
-				RTE_ETHER_ADDR_LEN * 1);
-				//RTE_ETHER_ADDR_LEN * hw->mac.rar_entry_count);
+				RTE_ETHER_ADDR_LEN);
 		error = -ENOMEM;
 		goto err_late;
 	}
@@ -1023,7 +999,6 @@ eth_mqnic_dev_init(struct rte_eth_dev *eth_dev)
 	rte_ether_addr_copy((struct rte_ether_addr *)hw->mac.addr,
 			&eth_dev->data->mac_addrs[0]);
 
-	hw->mac.get_link_status = 1;
 	adapter->stopped = 0;
 
 	PMD_INIT_LOG(DEBUG, "port_id %d vendorID=0x%x deviceID=0x%x",
@@ -1033,8 +1008,6 @@ eth_mqnic_dev_init(struct rte_eth_dev *eth_dev)
 	return 0;
 
 err_late:
-	//mqnic_hw_control_release(hw);
-
 	return error;
 }
 
@@ -1073,72 +1046,7 @@ static struct rte_pci_driver rte_mqnic_pmd = {
 static int
 mqnic_check_mq_mode(struct rte_eth_dev *dev)
 {
-	enum rte_eth_rx_mq_mode rx_mq_mode = dev->data->dev_conf.rxmode.mq_mode;
-	enum rte_eth_tx_mq_mode tx_mq_mode = dev->data->dev_conf.txmode.mq_mode;
-	uint16_t nb_rx_q = dev->data->nb_rx_queues;
-	uint16_t nb_tx_q = dev->data->nb_tx_queues;
-
-	if ((rx_mq_mode & ETH_MQ_RX_DCB_FLAG) ||
-	    tx_mq_mode == ETH_MQ_TX_DCB ||
-	    tx_mq_mode == ETH_MQ_TX_VMDQ_DCB) {
-		PMD_INIT_LOG(ERR, "DCB mode is not supported.");
-		return -EINVAL;
-	}
-	if (RTE_ETH_DEV_SRIOV(dev).active != 0) {
-		/* Check multi-queue mode.
-		 * To no break software we accept ETH_MQ_RX_NONE as this might
-		 * be used to turn off VLAN filter.
-		 */
-
-		if (rx_mq_mode == ETH_MQ_RX_NONE ||
-		    rx_mq_mode == ETH_MQ_RX_VMDQ_ONLY) {
-			dev->data->dev_conf.rxmode.mq_mode = ETH_MQ_RX_VMDQ_ONLY;
-			RTE_ETH_DEV_SRIOV(dev).nb_q_per_pool = 1;
-		} else {
-			/* Only support one queue on VFs.
-			 * RSS together with SRIOV is not supported.
-			 */
-			PMD_INIT_LOG(ERR, "SRIOV is active,"
-					" wrong mq_mode rx %d.",
-					rx_mq_mode);
-			return -EINVAL;
-		}
-		/* TX mode is not used here, so mode might be ignored.*/
-		if (tx_mq_mode != ETH_MQ_TX_VMDQ_ONLY) {
-			/* SRIOV only works in VMDq enable mode */
-			PMD_INIT_LOG(WARNING, "SRIOV is active,"
-					" TX mode %d is not supported. "
-					" Driver will behave as %d mode.",
-					tx_mq_mode, ETH_MQ_TX_VMDQ_ONLY);
-		}
-
-		/* check valid queue number */
-		if ((nb_rx_q > 1) || (nb_tx_q > 1)) {
-			PMD_INIT_LOG(ERR, "SRIOV is active,"
-					" only support one queue on VFs.");
-			return -EINVAL;
-		}
-	} else {
-		/* To no break software that set invalid mode, only display
-		 * warning if invalid mode is used.
-		 */
-		if (rx_mq_mode != ETH_MQ_RX_NONE &&
-		    rx_mq_mode != ETH_MQ_RX_VMDQ_ONLY &&
-		    rx_mq_mode != ETH_MQ_RX_RSS) {
-			/* RSS together with VMDq not supported*/
-			PMD_INIT_LOG(ERR, "RX mode %d is not supported.",
-				     rx_mq_mode);
-			return -EINVAL;
-		}
-
-		if (tx_mq_mode != ETH_MQ_TX_NONE &&
-		    tx_mq_mode != ETH_MQ_TX_VMDQ_ONLY) {
-			PMD_INIT_LOG(WARNING, "TX mode %d is not supported."
-					" Due to txmode is meaningless in this"
-					" driver, just ignore.",
-					tx_mq_mode);
-		}
-	}
+	RTE_SET_USED(dev);
 	return 0;
 }
 
@@ -1152,7 +1060,7 @@ eth_mqnic_configure(struct rte_eth_dev *dev)
 	/* multipe queue mode checking */
 	ret  = mqnic_check_mq_mode(dev);
 	if (ret != 0) {
-		PMD_DRV_LOG(ERR, "mqnic_check_mq_mode fails with %d.",
+		PMD_INIT_LOG(ERR, "mqnic_check_mq_mode fails with %d.",
 			    ret);
 		return ret;
 	}
@@ -1169,18 +1077,9 @@ eth_mqnic_start(struct rte_eth_dev *dev)
 		MQNIC_DEV_PRIVATE(dev->data->dev_private);
 	struct mqnic_priv *priv =
 		MQNIC_DEV_PRIVATE_TO_PRIV(dev->data->dev_private);
-	struct rte_pci_device *pci_dev = RTE_ETH_DEV_TO_PCI(dev);
-	struct rte_intr_handle *intr_handle = &pci_dev->intr_handle;
 	int ret;
 
 	PMD_INIT_FUNC_TRACE();
-
-	/* disable uio/vfio intr/eventfd mapping */
-	rte_intr_disable(intr_handle);
-
-	/* Power up the phy. Needed to make the link go Up */
-	eth_mqnic_dev_set_link_up(dev);
-
 	adapter->stopped = 0;
 
 	mqnic_all_event_queue_active(dev);
@@ -1217,9 +1116,7 @@ eth_mqnic_start(struct rte_eth_dev *dev)
 static int
 eth_mqnic_stop(struct rte_eth_dev *dev)
 {
-	struct rte_pci_device *pci_dev = RTE_ETH_DEV_TO_PCI(dev);
 	struct rte_eth_link link;
-	struct rte_intr_handle *intr_handle = &pci_dev->intr_handle;
 	struct mqnic_adapter *adapter =
 		MQNIC_DEV_PRIVATE(dev->data->dev_private);
 
@@ -1232,33 +1129,11 @@ eth_mqnic_stop(struct rte_eth_dev *dev)
 	mqnic_rx_cpl_queue_deactivate(dev);
 	mqnic_all_event_queue_deactivate(dev);
 	rte_delay_us_sleep(10000);
-
-	mqnic_intr_disable(dev);
-
-	/* disable intr eventfd mapping */
-	rte_intr_disable(intr_handle);
-
-	/* Power down the phy. Needed to make the link go Down */
-	eth_mqnic_dev_set_link_down(dev);
-
 	mqnic_dev_clear_queues(dev);
 
 	/* clear the recorded link status */
 	memset(&link, 0, sizeof(link));
 	rte_eth_linkstatus_set(dev, &link);
-
-	if (!rte_intr_allow_others(intr_handle))
-		/* resume to the default handler */
-		rte_intr_callback_register(intr_handle,
-					   eth_mqnic_interrupt_handler,
-					   (void *)dev);
-
-	/* Clean datapath event and queue/vec mapping */
-	rte_intr_efd_disable(intr_handle);
-	if (intr_handle->intr_vec != NULL) {
-		rte_free(intr_handle->intr_vec);
-		intr_handle->intr_vec = NULL;
-	}
 
 	adapter->stopped = true;
 	dev->data->dev_started = 0;
@@ -1267,25 +1142,9 @@ eth_mqnic_stop(struct rte_eth_dev *dev)
 }
 
 static int
-eth_mqnic_dev_set_link_up(struct rte_eth_dev *dev)
-{
-	RTE_SET_USED(dev);
-	return 0;
-}
-
-static int
-eth_mqnic_dev_set_link_down(struct rte_eth_dev *dev)
-{
-	RTE_SET_USED(dev);
-	return 0;
-}
-
-static int
 eth_mqnic_close(struct rte_eth_dev *dev)
 {
 	struct rte_eth_link link;
-	struct rte_pci_device *pci_dev = RTE_ETH_DEV_TO_PCI(dev);
-	struct rte_intr_handle *intr_handle = &pci_dev->intr_handle;
 	int ret;
 
 	if (rte_eal_process_type() != RTE_PROC_PRIMARY)
@@ -1298,11 +1157,6 @@ eth_mqnic_close(struct rte_eth_dev *dev)
 	mqnic_tx_cpl_queue_destroy(dev);
 	mqnic_rx_cpl_queue_destroy(dev);
 	mqnic_all_event_queue_destroy(dev);
-
-	if (intr_handle->intr_vec) {
-		rte_free(intr_handle->intr_vec);
-		intr_handle->intr_vec = NULL;
-	}
 
 	memset(&link, 0, sizeof(link));
 	rte_eth_linkstatus_set(dev, &link);
@@ -1450,12 +1304,9 @@ eth_mqnic_supported_ptypes_get(struct rte_eth_dev *dev)
 static int
 eth_mqnic_link_update(struct rte_eth_dev *dev, int wait_to_complete)
 {
-	struct mqnic_hw *hw =
-		MQNIC_DEV_PRIVATE_TO_HW(dev->data->dev_private);
 	struct rte_eth_link link;
 
 	RTE_SET_USED(wait_to_complete);
-	hw->mac.get_link_status = 1;
 
 	memset(&link, 0, sizeof(link));
 
@@ -1483,64 +1334,6 @@ eth_mqnic_promiscuous_disable(struct rte_eth_dev *dev)
 	return 0;
 }
 
-/*
- * It reads ICR and gets interrupt causes, check it and set a bit flag
- * to update link status.
- *
- * @param dev
- *  Pointer to struct rte_eth_dev.
- *
- * @return
- *  - On success, zero.
- *  - On failure, a negative value.
- */
-static int
-eth_mqnic_interrupt_get_status(struct rte_eth_dev *dev)
-{
-	RTE_SET_USED(dev);
-	return 0;
-}
-
-/*
- * It executes link_update after knowing an interrupt is prsent.
- *
- * @param dev
- *  Pointer to struct rte_eth_dev.
- *
- * @return
- *  - On success, zero.
- *  - On failure, a negative value.
- */
-static int
-eth_mqnic_interrupt_action(struct rte_eth_dev *dev,
-			 struct rte_intr_handle *intr_handle)
-{
-	RTE_SET_USED(dev);
-	RTE_SET_USED(intr_handle);
-
-	return 0;
-}
-
-/**
- * Interrupt handler which shall be registered at first.
- *
- * @param handle
- *  Pointer to interrupt handle.
- * @param param
- *  The address of parameter (struct rte_eth_dev *) regsitered before.
- *
- * @return
- *  void
- */
-static void
-eth_mqnic_interrupt_handler(void *param)
-{
-	struct rte_eth_dev *dev = (struct rte_eth_dev *)param;
-
-	eth_mqnic_interrupt_get_status(dev);
-	eth_mqnic_interrupt_action(dev, dev->intr_handle);
-}
-
 static int
 eth_mqnic_mtu_set(struct rte_eth_dev *dev, uint16_t mtu)
 {
@@ -1550,7 +1343,7 @@ eth_mqnic_mtu_set(struct rte_eth_dev *dev, uint16_t mtu)
 
 RTE_PMD_REGISTER_PCI(net_mqnic_igb, rte_mqnic_pmd);
 RTE_PMD_REGISTER_PCI_TABLE(net_mqnic_igb, pci_id_mqnic_map);
-RTE_PMD_REGISTER_KMOD_DEP(net_mqnic_igb, "* mqnic_uio | uio_pci_generic | vfio-pci");
+RTE_PMD_REGISTER_KMOD_DEP(net_mqnic_igb, "uio_pci_generic");
 
 /* see mqnic_logs.c */
 RTE_INIT(mqnic_init_log)
